@@ -1,6 +1,7 @@
 package io.kernel.ktor.response
 
-import io.kernel.ktor.exception.KtorKitException
+import io.kernel.ktor.exception.DefaultExceptionHandler
+import io.kernel.ktor.exception.ExceptionHandler
 
 /**
  * 响应映射器接口
@@ -27,7 +28,8 @@ interface ResponseMapper {
  * 默认响应映射器
  */
 class DefaultResponseMapper(
-    private val successCode: Int = 0
+    private val successCode: Int = 0,
+    private val exceptionHandler: ExceptionHandler = DefaultExceptionHandler()
 ) : ResponseMapper {
 
     override fun <T> map(response: WrappedResponse<T>): ApiResponse<T> {
@@ -46,39 +48,7 @@ class DefaultResponseMapper(
     }
 
     override fun mapError(throwable: Throwable): ApiResponse.Error {
-        val exception = io.kernel.ktor.exception.ErrorMapper.map(throwable)
-        return when (exception) {
-            is KtorKitException.ServerException -> ApiResponse.Error(
-                code = exception.code,
-                message = exception.message,
-                exception = exception
-            )
-            is KtorKitException.AuthException -> ApiResponse.Error(
-                code = 401,
-                message = exception.message,
-                exception = exception
-            )
-            is KtorKitException.TimeoutException -> ApiResponse.Error(
-                code = 408,
-                message = exception.message,
-                exception = exception
-            )
-            is KtorKitException.NetworkException -> ApiResponse.Error(
-                code = -1,
-                message = exception.message,
-                exception = exception
-            )
-            is KtorKitException.ParseException -> ApiResponse.Error(
-                code = -2,
-                message = exception.message,
-                exception = exception
-            )
-            else -> ApiResponse.Error(
-                code = -1,
-                message = exception.message ?: "Unknown error",
-                exception = exception
-            )
-        }
+        return exceptionHandler.handleException(throwable)
     }
 }
 
@@ -90,7 +60,8 @@ class CustomResponseMapper(
     private val successCodeExtractor: (Any?) -> Int,
     private val messageExtractor: (Any?) -> String,
     private val dataExtractor: (Any?) -> Any?,
-    private val successCode: Int = 0
+    private val successCode: Int = 0,
+    private val exceptionHandler: ExceptionHandler = DefaultExceptionHandler()
 ) : ResponseMapper {
 
     override fun <T> map(response: WrappedResponse<T>): ApiResponse<T> {
@@ -111,6 +82,6 @@ class CustomResponseMapper(
     }
 
     override fun mapError(throwable: Throwable): ApiResponse.Error {
-        return DefaultResponseMapper().mapError(throwable)
+        return exceptionHandler.handleException(throwable)
     }
 }

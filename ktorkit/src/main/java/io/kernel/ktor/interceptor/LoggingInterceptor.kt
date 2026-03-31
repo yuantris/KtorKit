@@ -4,8 +4,6 @@ import android.util.Log
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
-import io.ktor.http.content.*
-import io.ktor.util.*
 
 /**
  * 日志拦截器配置
@@ -37,8 +35,9 @@ class LoggingInterceptor(
     private val config: LogConfig = LogConfig()
 ) : RequestInterceptor, ResponseInterceptor {
 
-    override suspend fun intercept(request: HttpRequestBuilder): Boolean {
+    override suspend fun intercept(request: Any): Boolean {
         if (!config.enabled) return true
+        if (request !is HttpRequestBuilder) return true
 
         val sb = StringBuilder()
         sb.appendLine("┌─────────────────────────────────────────────────────────")
@@ -53,7 +52,6 @@ class LoggingInterceptor(
         }
 
         if (config.level >= LogLevel.BODY && config.logBody) {
-            // 请求体需要在实际发送时记录，这里记录基本信息
             sb.appendLine("│ Body: <request body>")
         }
 
@@ -98,18 +96,5 @@ class LoggingInterceptor(
 
         Log.d(config.tag, sb.toString())
         return response
-    }
-}
-
-/**
- * 简单日志拦截器
- */
-class SimpleLoggingInterceptor(
-    private val tag: String = "KtorKit"
-) : RequestInterceptor {
-
-    override suspend fun intercept(request: HttpRequestBuilder): Boolean {
-        Log.d(tag, "→ ${request.method.value} ${request.url.buildString()}")
-        return true
     }
 }

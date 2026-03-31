@@ -11,15 +11,14 @@ class AuthInterceptor(
     private val excludedPaths: List<String> = emptyList()
 ) : RequestInterceptor {
 
-    override suspend fun intercept(request: HttpRequestBuilder): Boolean {
-        val path = request.url.buildString()
+    override suspend fun intercept(request: Any): Boolean {
+        if (request !is HttpRequestBuilder) return true
 
-        // 检查是否在排除列表中
+        val path = request.url.buildString()
         if (excludedPaths.any { path.contains(it) }) {
             return true
         }
 
-        // 应用认证
         authProvider.applyAuth(request)
         return true
     }
@@ -52,7 +51,9 @@ class OptionalAuthInterceptor(
     private val authProvider: AuthProvider
 ) : RequestInterceptor {
 
-    override suspend fun intercept(request: HttpRequestBuilder): Boolean {
+    override suspend fun intercept(request: Any): Boolean {
+        if (request !is HttpRequestBuilder) return true
+
         if (authProvider.isAuthenticated()) {
             authProvider.applyAuth(request)
         }

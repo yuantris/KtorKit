@@ -1,6 +1,7 @@
 package io.kernel.ktor.cache
 
 import android.content.Context
+import io.kernel.ktor.util.md5
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
@@ -8,7 +9,6 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import java.io.File
-import java.security.MessageDigest
 
 /**
  * 磁盘缓存管理器
@@ -173,11 +173,6 @@ class DiskCacheManager(
                 file.delete()
             }
         }
-    }
-
-    private fun String.md5(): String {
-        val bytes = MessageDigest.getInstance("MD5").digest(this.toByteArray())
-        return bytes.joinToString("") { "%02x".format(it) }
     }
 }
 

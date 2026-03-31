@@ -2,9 +2,13 @@ package io.kernel.ktor
 
 import android.content.Context
 import io.kernel.ktor.cache.CacheConfig
+import io.kernel.ktor.cache.CacheHandler
 import io.kernel.ktor.cache.DiskCacheManager
 import io.kernel.ktor.client.HttpClientConfig
 import io.kernel.ktor.client.HttpClientFactory
+import io.kernel.ktor.interceptor.InterceptorChain
+import io.kernel.ktor.interceptor.RequestInterceptor
+import io.kernel.ktor.interceptor.ResponseInterceptor
 import io.kernel.ktor.request.RequestBuilder
 import io.kernel.ktor.response.ApiResponse
 import io.kernel.ktor.response.DefaultResponseMapper
@@ -19,9 +23,24 @@ import kotlinx.serialization.serializer
 class KtorKit private constructor(
     val client: HttpClient,
     val cacheManager: DiskCacheManager,
-    val baseUrl: String,
-    val responseMapper: ResponseMapper
+    val cacheHandler: CacheHandler,
+    baseUrl: String,
+    val responseMapper: ResponseMapper,
+    val interceptorChain: InterceptorChain
 ) {
+    /**
+     * 基础 URL（可动态修改）
+     */
+    var baseUrl: String = baseUrl
+        private set
+
+    /**
+     * 更新基础 URL
+     * 用于开发时切换环境（开发/测试/生产）
+     */
+    fun updateBaseUrl(url: String) {
+        baseUrl = url
+    }
 
     companion object {
         @Volatile
@@ -92,10 +111,27 @@ class KtorKit private constructor(
                 cacheDirName = builder.cacheDirName
             )
 
-            // 创建响应映射器
-            val responseMapper = builder.responseMapper ?: DefaultResponseMapper(builder.successCode)
+            // 创建缓存处理器
+            val cacheHandler = CacheHandler(cacheManager)
 
-            return KtorKit(client, cacheManager, builder.baseUrl, responseMapper)
+            // 创建响应映射器
+            val responseMapper = builder.responseMapper
+                ?: DefaultResponseMapper(builder.successCode, builder.exceptionHandler)
+
+            // 创建拦截器链
+            val interceptorChain = InterceptorChain.create(
+                requestInterceptors = builder.requestInterceptors,
+                responseInterceptors = builder.responseInterceptors
+            )
+
+            return KtorKit(
+                client = client,
+                cacheManager = cacheManager,
+                cacheHandler = cacheHandler,
+                baseUrl = builder.baseUrl,
+                responseMapper = responseMapper,
+                interceptorChain = interceptorChain
+            )
         }
     }
 
@@ -103,7 +139,7 @@ class KtorKit private constructor(
      * 创建请求构建器
      */
     fun request(): RequestBuilder {
-        return RequestBuilder(client, baseUrl, responseMapper, cacheManager)
+        return RequestBuilder.create(client, baseUrl, responseMapper, cacheHandler, interceptorChain)
     }
 
     /**
@@ -133,11 +169,12 @@ class KtorKit private constructor(
         path: String,
         body: Any? = null,
         wrapped: Boolean = true,
+        cacheConfig: CacheConfig = CacheConfig(),
         headers: Map<String, String> = emptyMap(),
         queries: Map<String, Any?> = emptyMap()
     ): ApiResponse<T> {
         return request().apply {
-            path(path).post()
+            path(path).post().cache(cacheConfig)
             body?.let { body(it) }
             headers(headers)
             queries(queries)
@@ -154,11 +191,12 @@ class KtorKit private constructor(
         path: String,
         body: Any? = null,
         wrapped: Boolean = true,
+        cacheConfig: CacheConfig = CacheConfig(),
         headers: Map<String, String> = emptyMap(),
         queries: Map<String, Any?> = emptyMap()
     ): ApiResponse<T> {
         return request().apply {
-            path(path).put()
+            path(path).put().cache(cacheConfig)
             body?.let { body(it) }
             headers(headers)
             queries(queries)
@@ -174,11 +212,34 @@ class KtorKit private constructor(
     suspend inline fun <reified T> delete(
         path: String,
         wrapped: Boolean = true,
+        cacheConfig: CacheConfig = CacheConfig(),
         headers: Map<String, String> = emptyMap(),
         queries: Map<String, Any?> = emptyMap()
     ): ApiResponse<T> {
         return request().apply {
-            path(path).delete()
+            path(path).delete().cache(cacheConfig)
+            headers(headers)
+            queries(queries)
+        }.let { builder ->
+            if (wrapped) builder.executeWrapped(serializer<T>())
+            else builder.executeDirect(serializer<T>())
+        }
+    }
+
+    /**
+     * PATCH 请求
+     */
+    suspend inline fun <reified T> patch(
+        path: String,
+        body: Any? = null,
+        wrapped: Boolean = true,
+        cacheConfig: CacheConfig = CacheConfig(),
+        headers: Map<String, String> = emptyMap(),
+        queries: Map<String, Any?> = emptyMap()
+    ): ApiResponse<T> {
+        return request().apply {
+            path(path).patch().cache(cacheConfig)
+            body?.let { body(it) }
             headers(headers)
             queries(queries)
         }.let { builder ->
@@ -214,33 +275,12 @@ class KtorKit private constructor(
     suspend fun getCacheSize(): Long {
         return cacheManager.getSize()
     }
-
-    /**
-     * PATCH 请求
-     */
-    suspend inline fun <reified T> patch(
-        path: String,
-        body: Any? = null,
-        wrapped: Boolean = true,
-        headers: Map<String, String> = emptyMap(),
-        queries: Map<String, Any?> = emptyMap()
-    ): ApiResponse<T> {
-        return request().apply {
-            path(path).patch()
-            body?.let { body(it) }
-            headers(headers)
-            queries(queries)
-        }.let { builder ->
-            if (wrapped) builder.executeWrapped(serializer<T>())
-            else builder.executeDirect(serializer<T>())
-        }
-    }
 }
 
 /**
- * KtorKit 配置
+ * KtorKit 配置 (open class 支持扩展)
  */
-class KtorKitConfig {
+open class KtorKitConfig {
     /**
      * 基础 URL
      */
@@ -275,6 +315,12 @@ class KtorKitConfig {
      * 响应映射器
      */
     var responseMapper: ResponseMapper? = null
+
+    /**
+     * 异常处理器
+     */
+    var exceptionHandler: io.kernel.ktor.exception.ExceptionHandler =
+        io.kernel.ktor.exception.DefaultExceptionHandler()
 
     /**
      * 成功状态码
@@ -327,9 +373,19 @@ class KtorKitConfig {
     var userAgent: String = "KtorKit/1.0"
 
     /**
+     * 请求拦截器列表
+     */
+    val requestInterceptors: MutableList<RequestInterceptor> = mutableListOf()
+
+    /**
+     * 响应拦截器列表
+     */
+    val responseInterceptors: MutableList<ResponseInterceptor> = mutableListOf()
+
+    /**
      * 添加默认请求头
      */
-    fun header(key: String, value: String): KtorKitConfig {
+    open fun header(key: String, value: String): KtorKitConfig {
         defaultHeaders[key] = value
         return this
     }
@@ -337,8 +393,35 @@ class KtorKitConfig {
     /**
      * 添加默认查询参数
      */
-    fun parameter(key: String, value: Any?): KtorKitConfig {
+    open fun parameter(key: String, value: Any?): KtorKitConfig {
         defaultParameters[key] = value
+        return this
+    }
+
+    /**
+     * 添加请求拦截器
+     */
+    open fun addRequestInterceptor(interceptor: RequestInterceptor): KtorKitConfig {
+        requestInterceptors.add(interceptor)
+        return this
+    }
+
+    /**
+     * 添加响应拦截器
+     */
+    open fun addResponseInterceptor(interceptor: ResponseInterceptor): KtorKitConfig {
+        responseInterceptors.add(interceptor)
+        return this
+    }
+
+    /**
+     * 添加拦截器（自动识别类型）
+     */
+    open fun addInterceptor(interceptor: Any): KtorKitConfig {
+        when (interceptor) {
+            is RequestInterceptor -> requestInterceptors.add(interceptor)
+            is ResponseInterceptor -> responseInterceptors.add(interceptor)
+        }
         return this
     }
 }

@@ -1,13 +1,14 @@
 package io.kernel.ktor.request
 
 import io.kernel.ktor.cache.CacheConfig
-import io.kernel.ktor.cache.CacheStrategy
-import io.kernel.ktor.cache.DiskCacheManager
+import io.kernel.ktor.cache.CacheHandler
+import io.kernel.ktor.cache.CacheResult
+import io.kernel.ktor.interceptor.InterceptorChain
 import io.kernel.ktor.response.ApiResponse
 import io.kernel.ktor.response.ResponseMapper
 import io.kernel.ktor.response.WrappedResponse
+import io.kernel.ktor.util.md5
 import io.ktor.client.*
-import io.ktor.client.call.*
 import io.ktor.client.plugins.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
@@ -24,12 +25,15 @@ enum class RequestMethod {
 
 /**
  * 请求构建器
+ * 使用 CacheHandler 减少缓存逻辑重复
+ * 使用 InterceptorChain 统一管理拦截器
  */
 class RequestBuilder internal constructor(
     private val client: HttpClient,
     private val baseUrl: String,
     private val responseMapper: ResponseMapper,
-    private val cacheManager: DiskCacheManager? = null
+    private val cacheHandler: CacheHandler? = null,
+    private val interceptorChain: InterceptorChain = InterceptorChain.create()
 ) {
     private var path: String = ""
     private var method: RequestMethod = RequestMethod.GET
@@ -122,72 +126,19 @@ class RequestBuilder internal constructor(
     }
 
     /**
-     * 生成缓存 key
-     */
-    private fun generateCacheKey(): String {
-        val sb = StringBuilder()
-        sb.append(method.name).append(":").append(baseUrl).append(path)
-        if (queryParameters.isNotEmpty()) {
-            sb.append("?")
-            queryParameters.toSortedMap().forEach { (key, value) ->
-                sb.append(key).append("=").append(value).append("&")
-            }
-        }
-        return sb.toString().md5()
-    }
-
-    private fun String.md5(): String {
-        val bytes = java.security.MessageDigest.getInstance("MD5").digest(this.toByteArray())
-        return bytes.joinToString("") { "%02x".format(it) }
-    }
-
-    /**
      * 执行请求并返回包装响应
      */
     suspend fun <T> executeWrapped(serializer: KSerializer<T>): ApiResponse<T> {
         val cacheKey = cacheConfig.key ?: generateCacheKey()
 
-        // 缓存策略处理
-        if (cacheConfig.enabled && cacheManager != null) {
-            when (cacheConfig.strategy) {
-                CacheStrategy.CACHE_ONLY -> {
-                    val cached = cacheManager.getData(cacheKey)
-                    if (cached != null) {
-                        return try {
-                            val wrapped = Json.decodeFromString(WrappedResponse.serializer(serializer), cached)
-                            responseMapper.map(wrapped)
-                        } catch (e: Exception) {
-                            responseMapper.mapError(e)
-                        }
-                    }
+        // 先检查缓存
+        if (cacheHandler?.shouldCheckCacheFirst(cacheConfig) == true) {
+            when (val result = cacheHandler.getFromCache(cacheKey, cacheConfig, WrappedResponse.serializer(serializer))) {
+                is CacheResult.Hit -> return responseMapper.map(result.data)
+                is CacheResult.Error -> return responseMapper.mapError(result.exception)
+                is CacheResult.Miss -> if (cacheConfig.strategy == io.kernel.ktor.cache.CacheStrategy.CACHE_ONLY) {
                     return ApiResponse.Error(-1, "Cache miss")
                 }
-                CacheStrategy.CACHE_FIRST -> {
-                    val cached = cacheManager.getData(cacheKey)
-                    if (cached != null) {
-                        try {
-                            val wrapped = Json.decodeFromString(WrappedResponse.serializer(serializer), cached)
-                            return responseMapper.map(wrapped)
-                        } catch (e: Exception) {
-                            // 缓存解析失败，继续请求网络
-                        }
-                    }
-                }
-                CacheStrategy.NETWORK_FIRST -> {
-                    // 先请求网络，失败再用缓存
-                }
-                CacheStrategy.CACHE_UNTIL_EXPIRED -> {
-                    val cached = cacheManager.get(cacheKey)
-                    if (cached != null) {
-                        try {
-                            val wrapped = Json.decodeFromString(WrappedResponse.serializer(serializer), cached.data)
-                            return responseMapper.map(wrapped)
-                        } catch (e: Exception) {
-                            // 缓存过期或解析失败
-                        }
-                    }
-                }
-                else -> {}
             }
         }
 
@@ -197,24 +148,18 @@ class RequestBuilder internal constructor(
             val bodyText = response.bodyAsText()
             val wrapped = Json.decodeFromString(WrappedResponse.serializer(serializer), bodyText)
 
-            // 保存到缓存
-            if (cacheConfig.enabled && cacheManager != null && wrapped.code == 0) {
-                cacheManager.put(cacheKey, bodyText, cacheConfig.ttl)
+            // 成功时保存到缓存
+            if (wrapped.code == 0) {
+                cacheHandler?.saveToCache(cacheKey, cacheConfig, wrapped, WrappedResponse.serializer(serializer))
             }
 
             responseMapper.map(wrapped)
         } catch (e: Exception) {
-            // 网络失败时尝试使用缓存
-            if (cacheConfig.enabled && cacheManager != null &&
-                (cacheConfig.strategy == CacheStrategy.NETWORK_FIRST || cacheConfig.strategy == CacheStrategy.NETWORK_ONLY)) {
-                val cached = cacheManager.getData(cacheKey)
-                if (cached != null) {
-                    try {
-                        val wrapped = Json.decodeFromString(WrappedResponse.serializer(serializer), cached)
-                        return responseMapper.map(wrapped)
-                    } catch (ex: Exception) {
-                        // 缓存也失败
-                    }
+            // 网络失败时尝试从缓存恢复
+            if (cacheHandler?.shouldRecoverFromCache(cacheConfig) == true) {
+                when (val result = cacheHandler.recoverFromCache(cacheKey, cacheConfig, WrappedResponse.serializer(serializer))) {
+                    is CacheResult.Hit -> return responseMapper.map(result.data)
+                    else -> {}
                 }
             }
             responseMapper.mapError(e)
@@ -227,44 +172,14 @@ class RequestBuilder internal constructor(
     suspend fun <T> executeDirect(serializer: KSerializer<T>): ApiResponse<T> {
         val cacheKey = cacheConfig.key ?: generateCacheKey()
 
-        // 缓存策略处理
-        if (cacheConfig.enabled && cacheManager != null) {
-            when (cacheConfig.strategy) {
-                CacheStrategy.CACHE_ONLY -> {
-                    val cached = cacheManager.getData(cacheKey)
-                    if (cached != null) {
-                        return try {
-                            val data = Json.decodeFromString(serializer, cached)
-                            responseMapper.mapDirect(data)
-                        } catch (e: Exception) {
-                            responseMapper.mapError(e)
-                        }
-                    }
+        // 先检查缓存
+        if (cacheHandler?.shouldCheckCacheFirst(cacheConfig) == true) {
+            when (val result = cacheHandler.getFromCache(cacheKey, cacheConfig, serializer)) {
+                is CacheResult.Hit -> return responseMapper.mapDirect(result.data)
+                is CacheResult.Error -> return responseMapper.mapError(result.exception)
+                is CacheResult.Miss -> if (cacheConfig.strategy == io.kernel.ktor.cache.CacheStrategy.CACHE_ONLY) {
                     return ApiResponse.Error(-1, "Cache miss")
                 }
-                CacheStrategy.CACHE_FIRST -> {
-                    val cached = cacheManager.getData(cacheKey)
-                    if (cached != null) {
-                        try {
-                            val data = Json.decodeFromString(serializer, cached)
-                            return responseMapper.mapDirect(data)
-                        } catch (e: Exception) {
-                            // 缓存解析失败，继续请求网络
-                        }
-                    }
-                }
-                CacheStrategy.CACHE_UNTIL_EXPIRED -> {
-                    val cached = cacheManager.get(cacheKey)
-                    if (cached != null) {
-                        try {
-                            val data = Json.decodeFromString(serializer, cached.data)
-                            return responseMapper.mapDirect(data)
-                        } catch (e: Exception) {
-                            // 缓存过期或解析失败
-                        }
-                    }
-                }
-                else -> {}
             }
         }
 
@@ -275,23 +190,15 @@ class RequestBuilder internal constructor(
             val data = Json.decodeFromString(serializer, bodyText)
 
             // 保存到缓存
-            if (cacheConfig.enabled && cacheManager != null) {
-                cacheManager.put(cacheKey, bodyText, cacheConfig.ttl)
-            }
+            cacheHandler?.saveToCache(cacheKey, cacheConfig, data, serializer)
 
             responseMapper.mapDirect(data)
         } catch (e: Exception) {
-            // 网络失败时尝试使用缓存
-            if (cacheConfig.enabled && cacheManager != null &&
-                (cacheConfig.strategy == CacheStrategy.NETWORK_FIRST || cacheConfig.strategy == CacheStrategy.NETWORK_ONLY)) {
-                val cached = cacheManager.getData(cacheKey)
-                if (cached != null) {
-                    try {
-                        val data = Json.decodeFromString(serializer, cached)
-                        return responseMapper.mapDirect(data)
-                    } catch (ex: Exception) {
-                        // 缓存也失败
-                    }
+            // 网络失败时尝试从缓存恢复
+            if (cacheHandler?.shouldRecoverFromCache(cacheConfig) == true) {
+                when (val result = cacheHandler.recoverFromCache(cacheKey, cacheConfig, serializer)) {
+                    is CacheResult.Hit -> return responseMapper.mapDirect(result.data)
+                    else -> {}
                 }
             }
             responseMapper.mapError(e)
@@ -311,25 +218,11 @@ class RequestBuilder internal constructor(
     suspend fun executeString(): ApiResponse<String> {
         val cacheKey = cacheConfig.key ?: generateCacheKey()
 
-        // 缓存策略处理
-        if (cacheConfig.enabled && cacheManager != null) {
-            when (cacheConfig.strategy) {
-                CacheStrategy.CACHE_ONLY, CacheStrategy.CACHE_FIRST -> {
-                    val cached = cacheManager.getData(cacheKey)
-                    if (cached != null) {
-                        return ApiResponse.Success(cached)
-                    }
-                    if (cacheConfig.strategy == CacheStrategy.CACHE_ONLY) {
-                        return ApiResponse.Error(-1, "Cache miss")
-                    }
-                }
-                CacheStrategy.CACHE_UNTIL_EXPIRED -> {
-                    val cached = cacheManager.get(cacheKey)
-                    if (cached != null) {
-                        return ApiResponse.Success(cached.data)
-                    }
-                }
-                else -> {}
+        // 先检查缓存
+        if (cacheHandler?.shouldCheckCacheFirst(cacheConfig) == true) {
+            val cached = cacheHandler.getFromCache(cacheKey, cacheConfig, kotlinx.serialization.serializer<String>())
+            if (cached is CacheResult.Hit) {
+                return ApiResponse.Success(cached.data)
             }
         }
 
@@ -338,18 +231,15 @@ class RequestBuilder internal constructor(
             val bodyText = response.bodyAsText()
 
             // 保存到缓存
-            if (cacheConfig.enabled && cacheManager != null) {
-                cacheManager.put(cacheKey, bodyText, cacheConfig.ttl)
-            }
+            cacheHandler?.saveToCache(cacheKey, cacheConfig, bodyText, kotlinx.serialization.serializer())
 
             ApiResponse.Success(bodyText)
         } catch (e: Exception) {
-            // 网络失败时尝试使用缓存
-            if (cacheConfig.enabled && cacheManager != null &&
-                (cacheConfig.strategy == CacheStrategy.NETWORK_FIRST)) {
-                val cached = cacheManager.getData(cacheKey)
-                if (cached != null) {
-                    return ApiResponse.Success(cached)
+            // 网络失败时尝试从缓存恢复
+            if (cacheHandler?.shouldRecoverFromCache(cacheConfig) == true) {
+                val cached = cacheHandler.getFromCache(cacheKey, cacheConfig, kotlinx.serialization.serializer<String>())
+                if (cached is CacheResult.Hit) {
+                    return ApiResponse.Success(cached.data)
                 }
             }
             responseMapper.mapError(e)
@@ -357,12 +247,36 @@ class RequestBuilder internal constructor(
     }
 
     /**
-     * 执行请求
+     * 生成缓存 key
+     */
+    private fun generateCacheKey(): String {
+        val sb = StringBuilder()
+        sb.append(method.name).append(":").append(baseUrl).append(path)
+        if (queryParameters.isNotEmpty()) {
+            sb.append("?")
+            queryParameters.toSortedMap().forEach { (key, value) ->
+                sb.append(key).append("=").append(value).append("&")
+            }
+        }
+        return sb.toString().md5()
+    }
+
+    /**
+     * 执行请求（集成拦截器链）
      */
     private suspend fun executeRequest(): HttpResponse {
+        // 重置拦截器链
+        interceptorChain.reset()
+
+        // 执行请求拦截器
+        if (!interceptorChain.proceedRequest(this)) {
+            throw IllegalStateException("Request intercepted")
+        }
+
         val url = if (path.startsWith("http")) path else baseUrl + path
 
-        return client.request(url) {
+        // 执行 HTTP 请求
+        val response = client.request(url) {
             method = when (this@RequestBuilder.method) {
                 RequestMethod.GET -> HttpMethod.Get
                 RequestMethod.POST -> HttpMethod.Post
@@ -393,6 +307,9 @@ class RequestBuilder internal constructor(
                 }
             }
         }
+
+        // 执行响应拦截器
+        return interceptorChain.proceedResponse(response)
     }
 
     companion object {
@@ -403,9 +320,10 @@ class RequestBuilder internal constructor(
             client: HttpClient,
             baseUrl: String,
             responseMapper: ResponseMapper,
-            cacheManager: DiskCacheManager? = null
+            cacheHandler: CacheHandler? = null,
+            interceptorChain: InterceptorChain = InterceptorChain.create()
         ): RequestBuilder {
-            return RequestBuilder(client, baseUrl, responseMapper, cacheManager)
+            return RequestBuilder(client, baseUrl, responseMapper, cacheHandler, interceptorChain)
         }
     }
 }

@@ -1,8 +1,6 @@
 package io.kernel.ktor.interceptor
 
 import io.ktor.client.plugins.*
-import io.ktor.client.request.*
-import io.ktor.http.*
 import kotlinx.coroutines.delay
 
 /**
@@ -38,7 +36,7 @@ class RetryInterceptor(
 
     private var retryCount = 0
 
-    override suspend fun intercept(request: HttpRequestBuilder): Boolean {
+    override suspend fun intercept(request: Any): Boolean {
         retryCount = 0
         return true
     }
