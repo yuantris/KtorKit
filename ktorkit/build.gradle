@@ -1,0 +1,60 @@
+plugins {
+    alias(libs.plugins.android.library)
+    alias(libs.plugins.kotlin.serialization)
+}
+
+android {
+    namespace 'io.kernel.ktor'
+    compileSdk {
+        version = release(36) {
+            minorApiLevel = 1
+        }
+    }
+
+    defaultConfig {
+        minSdk 24
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles "consumer-rules.pro"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+}
+
+dependencies {
+    // Ktor
+    api libs.ktor.client.core
+    api libs.ktor.client.okhttp
+    api libs.ktor.client.logging
+    api libs.ktor.client.content.negotiation
+    api libs.ktor.client.auth
+    api libs.ktor.serialization.kotlinx.json
+
+    // Serialization
+    api libs.kotlinx.serialization.json
+
+    // OkHttp
+    api libs.okhttp
+
+    // Coroutines
+    api libs.coroutines.core
+    api libs.coroutines.android
+
+    // AndroidX
+    implementation libs.androidx.core.ktx
+    implementation libs.androidx.appcompat
+    implementation libs.material
+
+    testImplementation libs.junit
+    androidTestImplementation libs.androidx.junit
+    androidTestImplementation libs.androidx.espresso.core
+}
